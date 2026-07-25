@@ -1,0 +1,301 @@
+name: Claude PR Review (reusable)
+
+# Reusable PR-review workflow. Callers invoke it on their pull_request events
+# (for the always-on merge gate and the automatic first review) and on
+# issue_comment events (so a human can request a fresh review on demand by
+# commenting "/re-review" on the PR). This workflow decides internally whether
+# to run the Claude review and reports the `review / gate` status that gates
+# merging. The review rubric is pulled at run time from the review-code skill in
+# dcwalker/ai-skills (single source of truth); the review is posted as
+# claude[bot] via the installed Claude GitHub App.
+#
+# Triggers:
+#   - pull_request opened/ready_for_review/reopened (non-draft): automatic review.
+#   - issue_comment containing "/re-review" on a PR, from a repo
+#     owner/member/collaborator: an on-demand fresh review with the native
+#     progress UI that also blocks merging until it finishes (see "Merge gating").
+#   - Never for dependabot PRs (they cannot read the secrets below) or for PRs
+#     carrying the "skip-code-review" label.
+#   - Pushes (synchronize) do NOT re-run the review; the sticky "code-reviewed"
+#     label keeps the gate green.
+#
+# Merge gating (configured in each caller repo's branch protection):
+#   - Required status check: `review / gate`
+#   - Require conversation resolution before merging
+# On pull_request events the `gate` job reports `review / gate` as a check run on
+# the PR head. A "/re-review" comment, however, runs on the default branch, so
+# its check runs would NOT attach to the PR head; instead the review job posts
+# the `review / gate` *commit status* directly onto the PR head SHA — pending
+# while the review runs (merge blocked) and success only when it completes. A
+# failed or still-running re-review therefore keeps merging blocked.
+#
+# Caller example (in another repo owned by dcwalker):
+#   on:
+#     pull_request:
+#       types: [opened, ready_for_review, reopened, synchronize, labeled, unlabeled]
+#     issue_comment:
+#       types: [created]
+#   permissions:
+#     contents: read
+#     pull-requests: write
+#     statuses: write      # lets the re-review run post the `review / gate` status
+#     actions: read        # lets the action's github_ci MCP server read CI status
+#     id-token: write
+#   jobs:
+#     review:
+#       # Skip the per-comment fan-out unless it is actually a /re-review request.
+#       if: >
+#         github.event_name != 'issue_comment'
+#         || contains(github.event.comment.body, '/re-review')
+#       uses: dcwalker/workflows/.github/workflows/claude-review.yml@main
+#       secrets:
+#         CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+#         MARKETPLACE_READ_PAT:    ${{ secrets.MARKETPLACE_READ_PAT }}
+
+on:
+  workflow_call:
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+      MARKETPLACE_READ_PAT:
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write   # post the `review / gate` commit status for /re-review comment runs
+  actions: read     # lets the action's github_ci MCP server read CI status (granted by all callers)
+  id-token: write   # required for the action to fetch the OIDC token it exchanges for the claude[bot] app token
+
+# Turn budget for the Claude review. Bump this for large PRs that exhaust it (the
+# action fails with error_max_turns when the budget runs out). One place to edit
+# for all caller repos.
+env:
+  REVIEW_MAX_TURNS: "80"
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    # Centralized run conditions for every caller. Run the Claude review only
+    # when it is worth spending resources:
+    #   - a non-draft PR is opened, marked ready, or reopened, OR
+    #   - a repo owner/member/collaborator comments "/re-review" on a PR.
+    # Never run when:
+    #   - the PR is from dependabot: it uses the Dependabot secret source and
+    #     cannot read the secrets below, so a review would only ever fail, or
+    #   - the `skip-code-review` label opts the PR out.
+    # Pushes (synchronize) do NOT trigger a review by design; a prior review
+    # stays valid via the gate's sticky `code-reviewed` label. The author
+    # association check keeps untrusted commenters from spending review credits.
+    if: >
+      !contains(github.event.pull_request.labels.*.name, 'skip-code-review')
+      && !contains(github.event.issue.labels.*.name, 'skip-code-review')
+      && (
+        (
+          github.event_name == 'pull_request'
+          && github.actor != 'dependabot[bot]'
+          && github.event.pull_request.draft == false
+          && contains(fromJSON('["opened","ready_for_review","reopened"]'), github.event.action)
+        )
+        || (
+          github.event_name == 'issue_comment'
+          && github.event.issue.pull_request != null
+          && contains(github.event.comment.body, '/re-review')
+          && github.event.comment.user.type != 'Bot'
+          && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+        )
+      )
+    steps:
+      - name: Require secrets
+        env:
+          OAUTH: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          PAT: ${{ secrets.MARKETPLACE_READ_PAT }}
+        run: |
+          missing=()
+          [ -z "$OAUTH" ] && missing+=(CLAUDE_CODE_OAUTH_TOKEN)
+          [ -z "$PAT" ] && missing+=(MARKETPLACE_READ_PAT)
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing required secrets: ${missing[*]}"
+            exit 1
+          fi
+
+      - name: Resolve PR context
+        id: ctx
+        # Both event shapes funnel through one set of outputs: the PR number, the
+        # PR head SHA (needed for the commit status), and whether this run came
+        # from a /re-review comment.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          PR_FROM_PR: ${{ github.event.pull_request.number }}
+          PR_FROM_ISSUE: ${{ github.event.issue.number }}
+        run: |
+          if [ "$EVENT" = "issue_comment" ]; then
+            pr="$PR_FROM_ISSUE"; is_comment=true
+          else
+            pr="$PR_FROM_PR"; is_comment=false
+          fi
+          sha=$(gh pr view "$pr" -R "$REPO" --json headRefOid --jq .headRefOid)
+          {
+            echo "pr=$pr"
+            echo "sha=$sha"
+            echo "is_comment=$is_comment"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Block merge while re-review runs
+        id: block
+        if: steps.ctx.outputs.is_comment == 'true'
+        # A /re-review comment runs on the default branch, so the gate job's
+        # check run would not attach to the PR head. Post the `review / gate`
+        # commit status onto the PR head SHA so branch protection blocks the
+        # merge until this review completes, and drop the sticky `code-reviewed`
+        # marker so a concurrent pull_request gate cannot pass off it.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.ctx.outputs.pr }}
+          SHA: ${{ steps.ctx.outputs.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh api -X POST "repos/$REPO/statuses/$SHA" \
+            -f state=pending \
+            -f context='review / gate' \
+            -f description='Re-review in progress' \
+            -f target_url="$RUN_URL"
+          gh pr edit "$PR" -R "$REPO" --remove-label code-reviewed || true
+
+      - name: Checkout the PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.ctx.outputs.sha }}
+
+      - name: Fetch review-code skill (single source of truth)
+        env:
+          GH_TOKEN: ${{ secrets.MARKETPLACE_READ_PAT }}
+        run: |
+          mkdir -p .review
+          gh api repos/dcwalker/ai-skills/contents/plugins/software-development/skills/review-code/SKILL.md \
+            -H "Accept: application/vnd.github.raw" > .review/SKILL.md
+          echo "Fetched $(wc -l < .review/SKILL.md) lines of review rubric."
+
+      - name: Review the pull request
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # No github_token: the installed Claude GitHub App posts the inline
+          # comments as claude[bot].
+          # track_progress posts the live tracking comment; it is valid for the
+          # pull_request actions we run on (opened/ready_for_review/reopened) and
+          # for issue_comment, so a /re-review reads like a fresh review.
+          track_progress: true
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ steps.ctx.outputs.pr }}
+
+            Read .review/SKILL.md and review THIS pull request by following its
+            methodology. Provide feedback as inline comments on the specific
+            changed lines for concrete issues, and a top-level summary comment
+            with the overall risk level and the standards you reviewed against.
+            Only flag real issues.
+          # Tools the review needs: post inline comments (as claude[bot]), post the
+          # summary, read the diff/PR, and read the fetched skill + changed files.
+          claude_args: |
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Read,Grep,Glob"
+            --max-turns ${{ env.REVIEW_MAX_TURNS }}
+
+      - name: Mark PR as reviewed
+        if: success()
+        # Sticky marker so later pushes do not need a fresh review: the gate
+        # reads this label and stays green without re-running Claude. The label
+        # must already exist in the repo (created during setup).
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.ctx.outputs.pr }}
+        run: gh pr edit "$PR" -R "$REPO" --add-label code-reviewed
+
+      - name: Report re-review gate result
+        # Only for /re-review comment runs that actually posted the pending
+        # status above. Resolve the `review / gate` commit status to success on a
+        # clean run, or failure otherwise, so the merge stays blocked unless the
+        # review genuinely completed.
+        if: ${{ always() && steps.block.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.ctx.outputs.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          STATE: ${{ job.status == 'success' && 'success' || 'failure' }}
+        run: |
+          if [ "$STATE" = "success" ]; then
+            desc='Re-review complete'
+          else
+            desc='Re-review did not complete — see logs'
+          fi
+          gh api -X POST "repos/$REPO/statuses/$SHA" \
+            -f state="$STATE" \
+            -f context='review / gate' \
+            -f description="$desc" \
+            -f target_url="$RUN_URL"
+
+  gate:
+    # Always runs on pull_request events and reports the `review / gate` status
+    # check that branch protection requires. (For /re-review comment runs the
+    # review job posts that same status directly onto the PR head instead — see
+    # the header.) Passes when the review ran in this workflow, ran in an earlier
+    # run (github-actions[bot] applied 'code-reviewed' at some point — judged by
+    # the label event history, so a transient /re-review removal doesn't matter;
+    # a human-applied one is ignored), was intentionally skipped ('skip-code-review'
+    # label), or the PR is from dependabot (reviews are skipped for it). Comment
+    # resolution is enforced separately by the repo's "Require conversation
+    # resolution before merging" setting.
+    needs: [review]
+    if: ${{ always() && github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate code-review gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          REVIEW_RESULT: ${{ needs.review.result }}
+        run: |
+          author=$(gh pr view "$PR" -R "$REPO" --json author --jq '.author.login')
+          labels=$(gh pr view "$PR" -R "$REPO" --json labels --jq '.labels[].name')
+          has() { printf '%s\n' "$labels" | grep -qx "$1"; }
+
+          if [ "$author" = "dependabot[bot]" ] || [ "$author" = "app/dependabot" ]; then
+            echo "PASS: Dependabot PR — Claude review is intentionally skipped for it."
+            exit 0
+          fi
+          if has skip-code-review; then
+            echo "PASS: 'skip-code-review' label present — review intentionally skipped."
+            exit 0
+          fi
+          if [ "$REVIEW_RESULT" = "success" ]; then
+            echo "PASS: Claude review completed in this run."
+            exit 0
+          fi
+          # Has the review completed at least once? Trust the 'code-reviewed'
+          # marker ONLY if github-actions[bot] applied it (the workflow's "Mark PR
+          # as reviewed" step). A human, or a Claude agent acting with the owner's
+          # credentials, applying it from the UI/CLI is recorded under that login
+          # and must NOT count. ('skip-code-review' and '/re-review' stay human-driven.)
+          #
+          # Key on the label EVENT HISTORY, not current presence: an in-flight
+          # /re-review transiently removes the label at its start and re-adds it at
+          # the end (and one that fails/cancels before re-adding leaves it removed),
+          # so checking current presence would make a concurrent push's gate fail
+          # and stick. The bot-applied labeled event persists in history either way.
+          bot_applied=$(gh api --paginate "repos/$REPO/issues/$PR/events" \
+            --jq '[.[] | select(.event=="labeled" and .label.name=="code-reviewed" and .actor.login=="github-actions[bot]")] | length')
+          if [ "${bot_applied:-0}" -gt 0 ]; then
+            echo "PASS: 'code-reviewed' was applied by github-actions[bot] — review completed in an earlier run."
+            exit 0
+          fi
+          if has code-reviewed; then
+            echo "::warning::'code-reviewed' is present but was never applied by github-actions[bot]; ignoring it. Only the automated review may grant this label."
+          fi
+          echo "::error::Code review has not completed for this PR. It runs automatically on open/ready; comment '/re-review' to run it now, or apply 'skip-code-review' to bypass."
+          exit 1

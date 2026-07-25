@@ -1,0 +1,462 @@
+name: Sensitive info check (reusable)
+
+# Reusable workflow hosted centrally in dcwalker/workflows.
+# Each product repo keeps a thin caller stub; all logic lives here.
+#
+# Three modes (set by the caller passing event_name):
+#   pr     (event_name == pull_request) : preventive gate; scans PR diff and text
+#   push   (event_name == push)         : post-merge backstop; scans tree and new messages
+#   audit  (schedule / workflow_dispatch): weekly full-history audit
+#
+# Findings are reported as:
+#   tracked file 'path' at line:startCol-endCol  (1-based, endCol inclusive)
+#   commit message <sha>                          (no character span available)
+#   PR title/description at line:startCol-endCol (1-based, endCol inclusive)
+#
+# A SARIF 2.1.0 artifact (sensitive-info.sarif) is always uploaded for file matches.
+# Detective modes (push, audit) additionally open a leak-safe GitHub issue in the
+# calling repo when a match is found.
+
+on:
+  workflow_call:
+    inputs:
+      event_name:
+        description: 'github.event_name from the caller (pull_request, push, schedule, workflow_dispatch)'
+        type: string
+        required: true
+      actor:
+        description: 'github.actor from the caller — used to skip dependabot runs'
+        type: string
+        required: true
+      repository:
+        description: 'github.repository (owner/repo) of the calling repo — for GH_REPO in issue step'
+        type: string
+        required: true
+      ref_name:
+        description: 'github.ref_name of the caller — shown in the issue body'
+        type: string
+        required: true
+      run_url:
+        description: 'Full URL to the calling workflow run — shown in the issue body'
+        type: string
+        required: true
+      pr_base_sha:
+        description: 'Base SHA for a PR run (github.event.pull_request.base.sha)'
+        type: string
+        default: ''
+      pr_head_sha:
+        description: 'Head SHA for a PR run (github.event.pull_request.head.sha)'
+        type: string
+        default: ''
+      pr_title:
+        description: 'PR title to scan (github.event.pull_request.title)'
+        type: string
+        default: ''
+      pr_body:
+        description: 'PR body to scan (github.event.pull_request.body; max ~64 KB)'
+        type: string
+        default: ''
+      before_sha:
+        description: 'SHA before push (github.event.before) — empty on first push to branch'
+        type: string
+        default: ''
+      after_sha:
+        description: 'SHA after push (github.event.after)'
+        type: string
+        default: ''
+      assignee:
+        description: 'GitHub login to assign the issue to; leave empty to create unassigned'
+        type: string
+        default: 'dcwalker'
+    secrets:
+      SENSITIVE_DENYLIST:
+        required: true
+      GH_TOKEN:
+        description: 'github.token from the caller — used to create issues in the calling repo'
+        required: true
+
+jobs:
+  sensitive-info:
+    name: Sensitive info check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # full history for audit and PR/push ranges
+
+      - name: Scan for sensitive information
+        if: inputs.actor != 'dependabot[bot]'
+        env:
+          SENSITIVE_DENYLIST: ${{ secrets.SENSITIVE_DENYLIST }}
+          SCAN_MODE: ${{ inputs.event_name == 'pull_request' && 'pr' || (inputs.event_name == 'push' && 'push' || 'audit') }}
+          BASE_SHA: ${{ inputs.pr_base_sha }}
+          HEAD_SHA: ${{ inputs.pr_head_sha }}
+          PR_TITLE: ${{ inputs.pr_title }}
+          PR_BODY: ${{ inputs.pr_body }}
+          BEFORE_SHA: ${{ inputs.before_sha }}
+          AFTER_SHA: ${{ inputs.after_sha }}
+          FINDINGS_OUT: ${{ github.workspace }}/sensitive-info-findings.txt
+          SARIF_OUT: ${{ github.workspace }}/sensitive-info.sarif
+        run: |
+          set -uo pipefail
+          set +e  # grep/git-grep return 1 on "no match" (the passing case); -e would exit there
+
+          SCAN_MODE="${SCAN_MODE:-audit}"
+
+          PATTERNS_FILE="$(mktemp)"
+          WT_MATCHES="$(mktemp)"
+          FINDINGS_FILE="$(mktemp)"
+          # tab-separated structured span data for SARIF: uri<TAB>line<TAB>startCol<TAB>endColExclusive
+          SARIF_FINDINGS="$(mktemp)"
+          # scratch file reused per file/field for span deduplication
+          SPAN_WORK="$(mktemp)"
+          trap 'rm -f "$PATTERNS_FILE" "$WT_MATCHES" "$FINDINGS_FILE" "$SARIF_FINDINGS" "$SPAN_WORK"' EXIT
+
+          # Load denylist from the env secret: strip blank lines and comments, and mask
+          # each remaining pattern in the Actions log.
+          if [[ -n "${SENSITIVE_DENYLIST:-}" ]]; then
+            while IFS= read -r line; do
+              case "$line" in
+                ''|\#*) continue ;;
+              esac
+              printf '%s\n' "$line" >> "$PATTERNS_FILE"
+              printf '::add-mask::%s\n' "$line"
+            done <<< "$SENSITIVE_DENYLIST"
+          fi
+
+          # Fail closed: this check REQUIRES a configured denylist.
+          if [[ ! -s "$PATTERNS_FILE" ]]; then
+            echo "FAILED: SENSITIVE_DENYLIST is not set or contains no usable patterns."
+            echo "This check fails closed and requires a configured denylist (one regex per line)."
+            echo "Note: secrets are unavailable to fork-triggered PR runs, so forked PRs fail here."
+            exit 1
+          fi
+
+          # Validate every pattern as a usable extended regex before scanning.
+          INVALID=0
+          val_line=0
+          while IFS= read -r pat; do
+            val_line=$((val_line + 1))
+            printf '' | grep -qE -e "$pat" 2>/dev/null
+            if [[ "$?" -gt 1 ]]; then
+              echo "  ERROR: denylist pattern on line ${val_line} is not a valid extended regex."
+              INVALID=$((INVALID + 1))
+            fi
+          done < "$PATTERNS_FILE"
+          if [[ "$INVALID" -gt 0 ]]; then
+            echo "FAILED: ${INVALID} invalid denylist pattern(s). Fix them so every pattern is enforced."
+            exit 1
+          fi
+
+          PATTERN_COUNT=$(grep -c '' "$PATTERNS_FILE")
+          echo "Mode: ${SCAN_MODE}. Loaded ${PATTERN_COUNT} denylist pattern(s). Scanning (values are never printed)..."
+
+          # note_match loc — deduplicated write to FINDINGS_FILE and stdout.
+          note_match() {
+            local loc="$1"
+            if ! grep -qxF -- "$loc" "$FINDINGS_FILE"; then
+              echo "  MATCH: $loc"
+              printf '%s\n' "$loc" >> "$FINDINGS_FILE"
+            fi
+            return 0
+          }
+
+          # get_file_spans pat file — emit "line:startCol-endCol" per match (1-based, endCol inclusive).
+          # Never prints the matched content. Passes the pattern via env to avoid shell quoting issues.
+          get_file_spans() {
+            local pat="$1" file="$2"
+            PAT="$pat" perl -ne '
+              my $p = $ENV{PAT};
+              while (/$p/gi) { printf "%d:%d-%d\n", $., $-[0]+1, $+[0] }
+            ' "$file" 2>/dev/null
+          }
+
+          # Scan the current content of the given pathspec(s).
+          # Reports "tracked file 'path' at line:startCol-endCol" (1-based, endCol inclusive).
+          scan_tree() {
+            git grep -liE -f "$PATTERNS_FILE" -- "$@" > "$WT_MATCHES" 2>/dev/null
+            if [[ "$?" -gt 1 ]]; then
+              echo "  WARNING: git grep returned an error (possibly a malformed regex)." >&2
+            fi
+            while IFS= read -r f; do
+              [[ -n "$f" ]] || continue
+              > "$SPAN_WORK"
+              while IFS= read -r pat; do
+                [[ -z "$pat" ]] && continue
+                get_file_spans "$pat" "$f" >> "$SPAN_WORK"
+              done < "$PATTERNS_FILE"
+              if [[ ! -s "$SPAN_WORK" ]]; then
+                # Perl found nothing despite git grep matching — fall back to file-only location.
+                note_match "tracked file '$f'"
+              else
+                while IFS= read -r span; do
+                  local loc="tracked file '$f' at $span"
+                  if ! grep -qxF -- "$loc" "$FINDINGS_FILE"; then
+                    echo "  MATCH: $loc"
+                    printf '%s\n' "$loc" >> "$FINDINGS_FILE"
+                    # Record structured data for SARIF: uri TAB line TAB startCol TAB endColExclusive
+                    # span is "line:startCol-endColInclusive"; endColExclusive = endColInclusive + 1
+                    local ln rest sc ec_incl
+                    ln="${span%%:*}"
+                    rest="${span#*:}"
+                    sc="${rest%-*}"
+                    ec_incl="${rest##*-}"
+                    printf '%s\t%s\t%s\t%s\n' "$f" "$ln" "$sc" "$((ec_incl + 1))" >> "$SARIF_FINDINGS"
+                  fi
+                done < <(sort -u "$SPAN_WORK")
+              fi
+            done < "$WT_MATCHES"
+            return 0
+          }
+
+          # Scan commit MESSAGES in the given revision range.
+          # Reports "commit message <sha>" only — no character span available for git log output.
+          scan_messages() {
+            local range="$1"
+            while IFS= read -r pat; do
+              [[ -z "$pat" ]] && continue
+              while IFS= read -r sha; do
+                [[ -n "$sha" ]] && note_match "commit message ${sha}"
+              done < <(git log "$range" -i -E --format='%H' --grep="$pat" 2>/dev/null)
+            done < "$PATTERNS_FILE"
+            return 0
+          }
+
+          # Scan history CONTENT (added or removed lines) in the given range.
+          # Reports "content introduced/removed in commit <sha>" only — no span available.
+          scan_history_content() {
+            local range="$1"
+            while IFS= read -r pat; do
+              [[ -z "$pat" ]] && continue
+              while IFS= read -r sha; do
+                [[ -n "$sha" ]] && note_match "content introduced/removed in commit ${sha}"
+              done < <(git log "$range" -i -E --format='%H' -G"$pat" 2>/dev/null)
+            done < "$PATTERNS_FILE"
+            return 0
+          }
+
+          # Scan PR title and body text.
+          # Reports "PR title at line:startCol-endCol" or "PR description at line:startCol-endCol".
+          scan_pr_text() {
+            for field_label in "PR title" "PR description"; do
+              local text
+              if [[ "$field_label" == "PR title" ]]; then
+                text="${PR_TITLE:-}"
+              else
+                text="${PR_BODY:-}"
+              fi
+              [[ -z "$text" ]] && continue
+
+              > "$SPAN_WORK"
+              while IFS= read -r pat; do
+                [[ -z "$pat" ]] && continue
+                printf '%s\n' "$text" | PAT="$pat" perl -ne '
+                  my $p = $ENV{PAT};
+                  while (/$p/gi) { printf "%d:%d-%d\n", $., $-[0]+1, $+[0] }
+                ' 2>/dev/null >> "$SPAN_WORK"
+              done < "$PATTERNS_FILE"
+
+              if [[ -s "$SPAN_WORK" ]]; then
+                while IFS= read -r span; do
+                  note_match "${field_label} at $span"
+                done < <(sort -u "$SPAN_WORK")
+              else
+                # Fallback: grep confirms a match but Perl found no span
+                if printf '%s' "$text" | grep -qiE -f "$PATTERNS_FILE" 2>/dev/null; then
+                  note_match "$field_label"
+                fi
+              fi
+            done
+            return 0
+          }
+
+          # Generate SARIF 2.1.0 JSON from the structured SARIF_FINDINGS temp file.
+          # Only file matches produce SARIF entries; commit and PR-text matches are
+          # text-only. A valid SARIF file is written even when there are 0 file matches.
+          gen_sarif() {
+            SARIF_FINDINGS="$SARIF_FINDINGS" SARIF_OUT="${SARIF_OUT:-sensitive-info.sarif}" \
+            python3 - << 'PYEOF'
+          import json, os, sys
+
+          findings = []
+          raw_path = os.environ.get('SARIF_FINDINGS', '')
+          if raw_path:
+              with open(raw_path) as f:
+                  for line in f:
+                      parts = line.rstrip('\n').split('\t', 3)
+                      if len(parts) < 4:
+                          continue
+                      uri, ln, sc, ec = parts
+                      try:
+                          findings.append({
+                              'ruleId': 'sensitive-info',
+                              'message': {'text': 'Sensitive information match (value intentionally not shown)'},
+                              'locations': [{
+                                  'physicalLocation': {
+                                      'artifactLocation': {'uri': uri, 'uriBaseId': '%SRCROOT%'},
+                                      'region': {
+                                          'startLine': int(ln),
+                                          'startColumn': int(sc),
+                                          'endLine': int(ln),
+                                          'endColumn': int(ec)
+                                      }
+                                  }
+                              }]
+                          })
+                      except (ValueError, IndexError):
+                          pass
+
+          sarif = {
+              'version': '2.1.0',
+              '$schema': 'https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json',
+              'runs': [{
+                  'tool': {
+                      'driver': {
+                          'name': 'sensitive-info-check',
+                          'version': '2.0.0',
+                          'informationUri': 'https://github.com/dcwalker/workflows',
+                          'rules': [{
+                              'id': 'sensitive-info',
+                              'name': 'SensitiveInformation',
+                              'shortDescription': {'text': 'Sensitive information match'},
+                              'help': {
+                                  'text': (
+                                      'Remove or redact the sensitive content at the reported span. '
+                                      'File matches: path:line:startCol-endCol (1-based, end inclusive). '
+                                      'History matches: rewrite the affected commit.'
+                                  )
+                              }
+                          }]
+                      }
+                  },
+                  'results': findings
+              }]
+          }
+
+          out = os.environ.get('SARIF_OUT', 'sensitive-info.sarif')
+          with open(out, 'w') as fh:
+              json.dump(sarif, fh, indent=2)
+          print(f'SARIF: wrote {out} with {len(findings)} file match(es).')
+          PYEOF
+          }
+
+          # --- Scan dispatch ---
+
+          case "$SCAN_MODE" in
+            pr)
+              echo "== Changed files (current content) =="
+              changed=()
+              while IFS= read -r f; do
+                [[ -n "$f" ]] && [[ -e "$f" ]] && changed+=("$f")
+              done < <(git diff --name-only "${BASE_SHA:-HEAD~1}...${HEAD_SHA:-HEAD}" 2>/dev/null)
+              if [[ "${#changed[@]}" -gt 0 ]]; then
+                scan_tree "${changed[@]}"
+              else
+                echo "  (no changed files to scan)"
+              fi
+              echo "== PR commit messages =="
+              scan_messages "${BASE_SHA:-HEAD~1}..${HEAD_SHA:-HEAD}"
+              echo "== PR title and description =="
+              scan_pr_text
+              ;;
+            push)
+              echo "== Working tree =="
+              scan_tree .
+              echo "== Pushed commit messages =="
+              if [[ -n "${BEFORE_SHA:-}" ]] && [[ -n "${AFTER_SHA:-}" ]] && \
+                 ! printf '%s' "$BEFORE_SHA" | grep -qE '^0+$'; then
+                scan_messages "${BEFORE_SHA}..${AFTER_SHA}"
+              else
+                echo "  (no prior commit to diff against; working-tree scan covers current state)"
+              fi
+              ;;
+            audit)
+              echo "== Full history (content) =="
+              scan_history_content "--all"
+              echo "== Full history (commit messages) =="
+              scan_messages "--all"
+              echo "== Working tree =="
+              scan_tree .
+              ;;
+            *)
+              echo "FAILED: unknown SCAN_MODE '${SCAN_MODE}' (expected pr, push, or audit)."
+              exit 2
+              ;;
+          esac
+
+          FINDINGS=$(grep -c '' "$FINDINGS_FILE" 2>/dev/null || echo 0)
+          if [[ -n "${FINDINGS_OUT:-}" ]]; then
+            cp "$FINDINGS_FILE" "$FINDINGS_OUT"
+          fi
+
+          echo
+          echo "Generating SARIF artifact..."
+          gen_sarif || echo "  WARNING: SARIF generation failed; artifact skipped."
+
+          if [[ "$FINDINGS" -gt 0 ]]; then
+            echo
+            echo "FAILED: ${FINDINGS} sensitive-information match(es) found at the locations above."
+            echo "Values are intentionally not printed. File match spans are 'file:line:startCol-endCol'"
+            echo "(1-based, end column inclusive). Remove the sensitive content and, for history"
+            echo "matches, rewrite the affected commits before this check can pass."
+            exit 1
+          fi
+
+          echo "PASSED: no denylisted patterns found."
+          exit 0
+
+      - name: Upload SARIF artifact
+        if: always() && inputs.actor != 'dependabot[bot]'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sensitive-info-sarif
+          path: ${{ github.workspace }}/sensitive-info.sarif
+          if-no-files-found: ignore
+
+      - name: Open issue on detection (detective modes only)
+        if: failure() && inputs.event_name != 'pull_request' && inputs.actor != 'dependabot[bot]'
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GH_REPO: ${{ inputs.repository }}
+          SCAN_MODE: ${{ inputs.event_name == 'push' && 'push' || 'audit' }}
+          RUN_URL: ${{ inputs.run_url }}
+          REF_NAME: ${{ inputs.ref_name }}
+          ASSIGNEE: ${{ inputs.assignee }}
+          FINDINGS_OUT: ${{ github.workspace }}/sensitive-info-findings.txt
+        run: |
+          body_file="$(mktemp)"
+          {
+            echo "A sensitive-information scan failed on \`${REF_NAME}\` in **${SCAN_MODE}** mode."
+            echo
+            echo "Run: ${RUN_URL}"
+            echo
+            echo "Match locations (values are intentionally not shown):"
+            echo '```'
+            if [ -s "$FINDINGS_OUT" ]; then
+              cat "$FINDINGS_OUT"
+            else
+              echo "(no locations; the scan likely failed because SENSITIVE_DENYLIST is unset or invalid)"
+            fi
+            echo '```'
+            echo
+            echo "File match spans are reported as \`tracked file 'path' at line:startCol-endCol\` (1-based, end column inclusive)."
+            echo "Commit matches show only the SHA — use \`git show <sha>\` to inspect the content."
+            echo
+            echo "Remove the sensitive content and, for history matches, rewrite the affected commits."
+            echo "A downloadable \`sensitive-info.sarif\` artifact is attached to the workflow run."
+          } > "$body_file"
+          gh label create sensitive-info --color B60205 \
+            --description "Sensitive information detected by the scan" 2>/dev/null || true
+          existing="$(gh issue list --label sensitive-info --state open --json number --jq '.[0].number' 2>/dev/null)"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body-file "$body_file"
+          else
+            assignee_flag=""
+            [[ -n "${ASSIGNEE:-}" ]] && assignee_flag="--assignee ${ASSIGNEE}"
+            gh issue create --title "Sensitive information detected on ${REF_NAME}" \
+              --label sensitive-info $assignee_flag --body-file "$body_file"
+          fi
