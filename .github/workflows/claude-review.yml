@@ -261,7 +261,13 @@ jobs:
             exit 0
           fi
 
-          BAND=$(echo "$BODY" | sed -n 's/.*<!-- risk-level: \([a-z]*\) -->.*/\1/p' | head -1)
+          # The marker is a plain visible line, not an HTML comment: claude-code-action's
+          # comment-posting tool strips HTML comments before storing the comment, so an
+          # earlier <!-- risk-level: ... --> design never actually survived posting (confirmed
+          # by fetching a real posted comment back and finding zero "<!--" occurrences, while a
+          # raw `gh api` post of the same text preserved it -- isolating the strip to that tool).
+          LAST_LINE=$(echo "$BODY" | tail -1)
+          BAND=$(echo "$LAST_LINE" | sed -n 's/^RISK-LEVEL: \([A-Z]*\)$/\1/p' | tr '[:upper:]' '[:lower:]')
           case "$BAND" in
             none|low|medium|high|critical) ;;
             *)
