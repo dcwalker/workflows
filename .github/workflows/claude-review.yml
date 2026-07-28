@@ -38,6 +38,7 @@ name: Claude PR Review (reusable)
 #   permissions:
 #     contents: read
 #     pull-requests: write
+#     issues: write        # lets the workflow create/update the `code-reviewed` label
 #     statuses: write      # lets the re-review run post the `review / gate` status
 #     actions: read        # lets the action's github_ci MCP server read CI status
 #     id-token: write
@@ -63,6 +64,7 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  issues: write     # lets the workflow create/update the `code-reviewed` label
   statuses: write   # post the `review / gate` commit status for /re-review comment runs
   actions: read     # lets the action's github_ci MCP server read CI status (granted by all callers)
   id-token: write   # required for the action to fetch the OIDC token it exchanges for the claude[bot] app token
@@ -118,6 +120,21 @@ jobs:
             echo "::error::Missing required secrets: ${missing[*]}"
             exit 1
           fi
+
+      - name: Ensure code-reviewed label exists
+        # Idempotent: `gh label create --force` creates the label if it's missing
+        # and just updates color/description (no error) if it already exists. The
+        # gate job and the "Mark PR as reviewed" step both depend on this label
+        # existing in the caller repo; previously that was a manual one-time setup
+        # step per repo, which is easy to forget and fails "Mark PR as reviewed"
+        # with a cryptic 'code-reviewed' not found error when skipped.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh label create code-reviewed -R "$REPO" --force \
+            --color 0E8A16 \
+            --description "Applied automatically once the Claude PR review has completed"
 
       - name: Resolve PR context
         id: ctx
