@@ -237,6 +237,66 @@ jobs:
           PR: ${{ steps.ctx.outputs.pr }}
         run: gh pr edit "$PR" -R "$REPO" --add-label code-reviewed
 
+      - name: Apply risk-level label
+        if: success()
+        # Reads the <!-- risk-level: <band> --> marker review-code's SKILL.md
+        # appends to its PR summary (see dcwalker/ai-skills' review-code skill)
+        # and swaps the PR's risk-level label to match. Best-effort: a missing
+        # or unrecognized marker (e.g. an older review-code without this
+        # feature) logs a warning and skips labeling rather than failing the
+        # job -- exactly the kind of cascading failure that motivated fixing
+        # the code-reviewed label above, so this step must not repeat it.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.ctx.outputs.pr }}
+        run: |
+          set +e  # never fail the job from this best-effort step
+
+          BODY=$(gh api "repos/$REPO/issues/$PR/comments" --jq '
+            [.[] | select(.user.login == "claude[bot]")] | sort_by(.updated_at) | last | .body // empty
+          ')
+          if [ -z "$BODY" ]; then
+            echo "::warning::No claude[bot] comment found on PR #$PR; skipping risk-level labeling."
+            exit 0
+          fi
+
+          BAND=$(echo "$BODY" | sed -n 's/.*<!-- risk-level: \([a-z]*\) -->.*/\1/p' | head -1)
+          case "$BAND" in
+            none|low|medium|high|critical) ;;
+            *)
+              echo "::warning::No recognized risk-level marker found in the review comment; skipping risk-level labeling."
+              exit 0
+              ;;
+          esac
+
+          # Idempotent: safe to run on every review, not just the first.
+          gh label create "no risk"       -R "$REPO" --force --color 0E8A16 --description "review-code assessed this PR as no risk"       >/dev/null
+          gh label create "low risk"      -R "$REPO" --force --color C2E0C6 --description "review-code assessed this PR as low risk"      >/dev/null
+          gh label create "medium risk"   -R "$REPO" --force --color FBCA04 --description "review-code assessed this PR as medium risk"   >/dev/null
+          gh label create "high risk"     -R "$REPO" --force --color D93F0B --description "review-code assessed this PR as high risk"     >/dev/null
+          gh label create "critical risk" -R "$REPO" --force --color B60205 --description "review-code assessed this PR as critical risk" >/dev/null
+
+          case "$BAND" in
+            none) TARGET_LABEL="no risk" ;;
+            *) TARGET_LABEL="$BAND risk" ;;
+          esac
+          CURRENT_RISK_LABELS=$(gh pr view "$PR" -R "$REPO" --json labels --jq '
+            .labels[].name | select(. == "no risk" or . == "low risk" or . == "medium risk" or . == "high risk" or . == "critical risk")
+          ')
+          while IFS= read -r label; do
+            [ -z "$label" ] && continue
+            if [ "$label" != "$TARGET_LABEL" ]; then
+              gh pr edit "$PR" -R "$REPO" --remove-label "$label"
+            fi
+          done <<< "$CURRENT_RISK_LABELS"
+
+          if ! echo "$CURRENT_RISK_LABELS" | grep -qx "$TARGET_LABEL"; then
+            gh pr edit "$PR" -R "$REPO" --add-label "$TARGET_LABEL"
+          fi
+
+          echo "Applied '$TARGET_LABEL' label."
+
       - name: Report re-review gate result
         # Only for /re-review comment runs that actually posted the pending
         # status above. Resolve the `review / gate` commit status to success on a
