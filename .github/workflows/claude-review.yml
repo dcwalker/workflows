@@ -74,6 +74,10 @@ permissions:
 # for all caller repos.
 env:
   REVIEW_MAX_TURNS: "80"
+  # Which Claude Code build the review runs against. "stable" tracks the
+  # current release; pin an exact version (e.g. "2.1.243") to hold the review
+  # on a known-good build when a release regresses.
+  CLAUDE_CODE_VERSION: "stable"
 
 jobs:
   review:
@@ -196,10 +200,58 @@ jobs:
             -H "Accept: application/vnd.github.raw" > .review/SKILL.md
           echo "Fetched $(wc -l < .review/SKILL.md) lines of review rubric."
 
+      # Install Claude Code ourselves so a failed install fails *here*, loudly.
+      #
+      # The action's own install has repeatedly reported
+      #   ✔ Claude Code successfully installed!  Location: ~/.local/bin/claude
+      # while that file does not exist, then handed the path to the SDK, which
+      # dies with "ReferenceError: Claude Code native binary not found" — an
+      # error that names neither the install nor the real cause, and reads like
+      # a problem with the pull request under review. Upstream
+      # anthropics/claude-code-action#1242, #1254, and #1290 are all this same
+      # silent failure, and it has recurred across releases.
+      #
+      # Two things are done here that the action's install does not do:
+      #   1. Create ~/.local/bin first. The observed failure logs say
+      #      "(/home/runner/.local/bin does not exist)", which is the fix
+      #      requested in #1290.
+      #   2. Verify the binary actually runs, and retry, because the failure is
+      #      usually transient — the same action SHA installs cleanly minutes
+      #      later.
+      - name: Install and verify Claude Code
+        id: claude_install
+        run: |
+          set -euo pipefail
+          bin="$HOME/.local/bin/claude"
+          mkdir -p "$HOME/.local/bin"
+          for attempt in 1 2 3; do
+            echo "::group::Claude Code install attempt $attempt"
+            # The installer exits 0 even when it places nothing, so its exit
+            # code is deliberately not trusted; the check below is the gate.
+            curl -fsSL https://claude.ai/install.sh \
+              | bash -s -- "${CLAUDE_CODE_VERSION:-stable}" || true
+            echo "::endgroup::"
+            if [ -x "$bin" ] && version=$("$bin" --version 2>/dev/null); then
+              echo "Verified $bin ($version)"
+              echo "path=$bin" >> "$GITHUB_OUTPUT"
+              echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+              exit 0
+            fi
+            echo "::warning::Attempt $attempt installed no working binary at $bin"
+            # An `&&` here would trip `set -e` on the final attempt and skip
+            # the error below.
+            if [ "$attempt" -lt 3 ]; then sleep $((attempt * 10)); fi
+          done
+          echo "::error::Claude Code failed to install after 3 attempts: no working binary at $bin. This is the upstream silent-install failure (anthropics/claude-code-action#1290), not a problem with the pull request under review."
+          exit 1
+
       - name: Review the pull request
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Use the binary verified above instead of the action's own install,
+          # which is the step that fails silently.
+          path_to_claude_code_executable: ${{ steps.claude_install.outputs.path }}
           # No github_token: the installed Claude GitHub App posts the inline
           # comments as claude[bot].
           # track_progress posts the live tracking comment; it is valid for the
