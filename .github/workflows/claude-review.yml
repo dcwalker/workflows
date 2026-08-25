@@ -74,10 +74,14 @@ permissions:
 # for all caller repos.
 env:
   REVIEW_MAX_TURNS: "80"
-  # Which Claude Code build the review runs against. "stable" tracks the
-  # current release; pin an exact version (e.g. "2.1.243") to hold the review
-  # on a known-good build when a release regresses.
-  CLAUDE_CODE_VERSION: "stable"
+  # Which Claude Code build the review runs against.
+  #
+  # Pinned, not "stable". Supplying the executable takes version selection away
+  # from the action, which pins an exact build of its own; defaulting to a
+  # floating channel here would quietly trade that reproducibility away. This
+  # is the build the last known-good review ran on. "stable" and "latest" are
+  # accepted if you want to track a channel deliberately.
+  CLAUDE_CODE_VERSION: "2.1.243"
 
 jobs:
   review:
@@ -216,7 +220,7 @@ jobs:
       #      "(/home/runner/.local/bin does not exist)", which is the fix
       #      requested in #1290.
       #   2. Verify the binary actually runs, and retry, because the failure is
-      #      usually transient — the same action SHA installs cleanly minutes
+      #      often transient — the same action SHA installs cleanly minutes
       #      later.
       - name: Install and verify Claude Code
         id: claude_install
@@ -224,25 +228,62 @@ jobs:
           set -euo pipefail
           bin="$HOME/.local/bin/claude"
           mkdir -p "$HOME/.local/bin"
+          # Outside the checkout: this step runs after it, and the review reads
+          # the working tree with git. A stray install.sh in the repo root
+          # would show up as an untracked file in the diff being reviewed.
+          installer="$(mktemp -d)/install.sh"
+
+          # A binary left by an earlier attempt, or by anything else on the
+          # image, must not be mistaken for a successful install: the action no
+          # longer backstops us, because a supplied executable is passed to the
+          # SDK unverified. Removing it first makes the check below prove that
+          # *this* attempt produced it.
+          rm -f "$bin"
+
           for attempt in 1 2 3; do
-            echo "::group::Claude Code install attempt $attempt"
-            # The installer exits 0 even when it places nothing, so its exit
-            # code is deliberately not trusted; the check below is the gate.
-            curl -fsSL https://claude.ai/install.sh \
-              | bash -s -- "${CLAUDE_CODE_VERSION:-stable}" || true
-            echo "::endgroup::"
-            if [ -x "$bin" ] && version=$("$bin" --version 2>/dev/null); then
-              echo "Verified $bin ($version)"
-              echo "path=$bin" >> "$GITHUB_OUTPUT"
-              echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-              exit 0
+            echo "Claude Code install attempt $attempt (version: $CLAUDE_CODE_VERSION)"
+            # curl's status is kept and reported. `| bash || true` would discard
+            # it, which is what upstream deliberately stopped doing in #1136 —
+            # a 403 or 429 from the CDN otherwise looks like a clean install.
+            # bash's own status stays untrusted: exiting 0 having installed
+            # nothing is the bug this step exists to catch.
+            set +e
+            curl -fsSL --retry 2 --retry-connrefused -o "$installer" \
+              https://claude.ai/install.sh
+            curl_status=$?
+            set -e
+            if [ "$curl_status" -ne 0 ]; then
+              echo "::warning::Attempt $attempt: could not download the installer (curl exit $curl_status)"
+              reason="the installer could not be downloaded (curl exit $curl_status)"
+            else
+              # stderr is kept: install.sh explains exit 137 (the OOM kill that
+              # hits when the runner is short on memory) and other signal
+              # deaths, and that explanation is the whole point of this step.
+              install_log=$(bash "$installer" "$CLAUDE_CODE_VERSION" 2>&1) || true
+              echo "$install_log"
+              if [ ! -e "$bin" ]; then
+                reason="the installer placed no binary at $bin"
+              elif [ ! -x "$bin" ]; then
+                reason="$bin exists but is not executable"
+              elif ! version_output=$("$bin" --version 2>&1); then
+                reason="$bin failed to run: $version_output"
+              elif [ -z "$version_output" ]; then
+                reason="$bin ran but reported no version"
+              else
+                echo "Verified $bin ($version_output)"
+                echo "path=$bin" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              echo "::warning::Attempt $attempt: $reason"
             fi
-            echo "::warning::Attempt $attempt installed no working binary at $bin"
-            # An `&&` here would trip `set -e` on the final attempt and skip
-            # the error below.
+            rm -f "$bin"
             if [ "$attempt" -lt 3 ]; then sleep $((attempt * 10)); fi
           done
-          echo "::error::Claude Code failed to install after 3 attempts: no working binary at $bin. This is the upstream silent-install failure (anthropics/claude-code-action#1290), not a problem with the pull request under review."
+
+          # States what was observed rather than asserting a cause. Blaming
+          # #1290 unconditionally would misdiagnose a proxy outage, a bad
+          # CLAUDE_CODE_VERSION, or an OOM kill with equal confidence.
+          echo "::error::Claude Code was not installed after 3 attempts: $reason. If the installer reported success while placing nothing, this is the upstream silent-install failure (anthropics/claude-code-action#1290) rather than a problem with the pull request under review."
           exit 1
 
       - name: Review the pull request
