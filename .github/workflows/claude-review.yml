@@ -33,7 +33,10 @@ name: Claude PR Review (reusable)
 # the `review / gate` *commit status* directly onto the PR head SHA — pending
 # while the review runs (merge blocked) and success only when it completes with
 # a no or low risk rating. A failed, still-running, or medium-or-higher re-review
-# therefore keeps merging blocked.
+# therefore keeps merging blocked. A passing re-review also re-runs the PR head's
+# most recent `review / gate` check run if it failed (for example, on a push made
+# while the PR was rated high risk): GitHub counts that check run, and the commit
+# status alone would not clear it.
 #
 # Caller example (in another repo owned by dcwalker):
 #   on:
@@ -46,7 +49,7 @@ name: Claude PR Review (reusable)
 #     pull-requests: write
 #     issues: write        # lets the workflow create/update the `code-reviewed` label
 #     statuses: write      # lets the re-review run post the `review / gate` status
-#     actions: read        # lets the action's github_ci MCP server read CI status
+#     actions: write       # lets a passing re-review re-run a stale failed gate job; also CI status reads
 #     id-token: write
 #   jobs:
 #     review:
@@ -72,7 +75,7 @@ permissions:
   pull-requests: write
   issues: write     # lets the workflow create/update the `code-reviewed` label
   statuses: write   # post the `review / gate` commit status for /re-review comment runs
-  actions: read     # lets the action's github_ci MCP server read CI status (granted by all callers)
+  actions: write    # lets a passing /re-review re-run a stale failed `review / gate` job; also lets the github_ci MCP server read CI status (callers must grant it)
   id-token: write   # required for the action to fetch the OIDC token it exchanges for the claude[bot] app token
 
 # Turn budget for the Claude review. Bump this for large PRs that exhaust it (the
@@ -378,6 +381,41 @@ jobs:
             -f context='review / gate' \
             -f description="$desc" \
             -f target_url="$RUN_URL"
+
+      - name: Re-run a stale failed gate check
+        # A passing /re-review posts the `review / gate` commit status, but a
+        # `review / gate` check run that failed on an earlier pull_request event
+        # (for example, a push made while the PR was still rated high risk)
+        # keeps blocking the merge: GitHub counts the most recent check run with
+        # that name, and nothing re-runs it. Re-run that gate job so it re-reads
+        # the labels this review just applied. A check run's id is its Actions
+        # job id; re-running a job needs `actions: write` from the caller.
+        if: ${{ success() && steps.block.outcome == 'success' && (steps.summary.outputs.band == 'none' || steps.summary.outputs.band == 'low') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.ctx.outputs.sha }}
+        run: |
+          # The most recently started `review / gate` check run from GitHub Actions
+          # on the PR head, as: started_at, status, conclusion, id. A queued run has
+          # no started_at yet; sort it last so it counts as the most recent.
+          latest=$(gh api --paginate "repos/$REPO/commits/$SHA/check-runs?check_name=review%20/%20gate&filter=all&per_page=100" \
+            --jq '.check_runs[] | select(.app.slug == "github-actions") | [(.started_at // "9999-12-31T23:59:59Z"), .status, (.conclusion // "none"), .id] | @tsv' \
+            | sort | tail -1)
+          if [ -z "$latest" ]; then
+            echo "No review / gate check run on $SHA; nothing to re-run."
+            exit 0
+          fi
+          IFS=$'\t' read -r started status conclusion job_id <<< "$latest"
+          if [ "$status" != "completed" ] || [ "$conclusion" != "failure" ]; then
+            echo "Latest review / gate check run (job $job_id, started $started) is $status/$conclusion; nothing to re-run."
+            exit 0
+          fi
+          if ! gh api -X POST "repos/$REPO/actions/jobs/$job_id/rerun" > /dev/null; then
+            echo "::error::Could not re-run the failed review / gate job $job_id on $SHA, so it still blocks the merge. Grant 'actions: write' in the caller workflow, or re-run that job from the Actions tab. Runs older than 30 days cannot be re-run; push a commit to start a new gate run instead."
+            exit 1
+          fi
+          echo "Re-ran review / gate job $job_id (started $started), which had failed on $SHA."
 
   gate:
     # Always runs on pull_request events and reports the `review / gate` status
