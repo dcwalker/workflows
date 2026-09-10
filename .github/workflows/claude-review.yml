@@ -216,6 +216,7 @@ jobs:
           echo "Fetched $(wc -l < .review/SKILL.md) lines of review rubric."
 
       - name: Review the pull request
+        id: review
         uses: anthropics/claude-code-action@v1
         env:
           # Run every subagent in the foreground. The action exits as soon as
@@ -253,10 +254,43 @@ jobs:
           # own generic wrapper prompt explicitly instructs the run to use
           # `git diff origin/main...HEAD` / `git log origin/main..HEAD` to gather PR
           # context -- without them every review run reliably hits permission denials
-          # on its very first context-gathering step. Both are read-only.
+          # on its very first context-gathering step. Bash(git status:*) is named in
+          # that same prompt, and Bash(git show:*)/Bash(git grep:*) read file contents
+          # at a commit and search the checkout. All five git commands are read-only;
+          # `gh api` stays out because it can also write. The "Log denied tool calls"
+          # step below lists anything still denied.
           claude_args: |
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Read,Grep,Glob"
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(git grep:*),Read,Grep,Glob"
             --max-turns ${{ env.REVIEW_MAX_TURNS }}
+
+      - name: Log denied tool calls
+        # The action logs only how many tool calls were denied. List them, grouped
+        # by tool (and for Bash, the command's first two words), then each call's
+        # input cut to 150 characters, so --allowedTools above can be tuned from
+        # real runs. The input can include a command or file path from the review,
+        # visible to anyone who can read this repo's Actions logs. Runs even when
+        # the review failed, and never fails the job.
+        if: ${{ always() && steps.review.outputs.execution_file != '' }}
+        env:
+          EXECUTION_FILE: ${{ steps.review.outputs.execution_file }}
+        run: |
+          jq -r '
+            # "label" is a reserved word in jq, hence denial_label.
+            def denial_label:
+              if .tool_name == "Bash"
+              then "Bash(\((.tool_input.command // "") | split(" ") | map(select(length > 0)) | .[0:2] | join(" ")))"
+              else .tool_name
+              end;
+            ([.[] | select(.type == "result")] | last | .permission_denials // []) as $denials
+            | if ($denials | length) == 0 then
+                "No tool calls were denied."
+              else
+                "\($denials | length) tool call(s) denied, by tool:",
+                ($denials | group_by(denial_label) | map({count: length, tool: (.[0] | denial_label)}) | sort_by(-.count) | .[] | "  \(.count)  \(.tool)"),
+                "Each denied call:",
+                ($denials[] | "  - \(denial_label): \(.tool_input | tostring | .[0:150])")
+              end
+          ' "$EXECUTION_FILE" || echo "::warning::Could not read denied tool calls from $EXECUTION_FILE"
 
       - name: Verify the review posted its summary
         id: summary
