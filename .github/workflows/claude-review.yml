@@ -205,6 +205,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ steps.ctx.outputs.sha }}
+          # Full history, so origin/main and the merge base that
+          # `git diff origin/main...HEAD` needs are present before the review
+          # starts: claude-code-action only passes --depth to its own fetches
+          # when the checkout is shallow. The reviewer is not allowed to run
+          # `git fetch`, whose --upload-pack option can run a local command.
+          fetch-depth: 0
 
       - name: Fetch review-code skill (single source of truth)
         env:
@@ -253,7 +259,8 @@ jobs:
             redirect output to files (for example `> /tmp/out.txt`), and read
             files directly instead of writing scripts to parse them. Commands
             that write files or run scripts, such as python3, are denied in
-            this run.
+            this run. origin/main is already fetched with full history, so do
+            not run git fetch; it is denied too.
           # Tools the review needs: post inline comments (as claude[bot]), post the
           # summary, read the diff/PR, and read the fetched skill + changed files.
           # Bash(git diff:*)/Bash(git log:*) are included because claude-code-action's
@@ -263,13 +270,14 @@ jobs:
           # on its very first context-gathering step. Bash(git status:*) is named in
           # that same prompt, and Bash(git show:*)/Bash(git grep:*) read file contents
           # at a commit and search the checkout; those five are read-only.
-          # Bash(git fetch:*) lets a review refresh origin/main before diffing, which
-          # every review tried in the first logged runs (16 of 27 denials); it
-          # downloads from origin and updates local refs but cannot push. `gh api`
+          # Bash(git fetch:*) is deliberately absent: its --upload-pack option runs a
+          # local command against a file:// remote, which a prompt injection in the PR
+          # could use. Every review tried git fetch in the first logged runs (16 of 27
+          # denials), so the checkout above fetches full history instead. `gh api`
           # stays out because it can also write. The "Log denied tool calls" step
           # below lists anything still denied.
           claude_args: |
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(git grep:*),Bash(git fetch:*),Read,Grep,Glob"
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(git grep:*),Read,Grep,Glob"
             --max-turns ${{ env.REVIEW_MAX_TURNS }}
 
       - name: Log denied tool calls
