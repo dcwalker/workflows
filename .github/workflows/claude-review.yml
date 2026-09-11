@@ -248,6 +248,12 @@ jobs:
             delegate part of the review to a subagent, run it in the foreground
             and wait for its result. Do not finish until the inline comments
             and the summary comment, ending with its RISK-LEVEL line, are posted.
+
+            Run each command so its output comes straight back to you: do not
+            redirect output to files (for example `> /tmp/out.txt`), and read
+            files directly instead of writing scripts to parse them. Commands
+            that write files or run scripts, such as python3, are denied in
+            this run.
           # Tools the review needs: post inline comments (as claude[bot]), post the
           # summary, read the diff/PR, and read the fetched skill + changed files.
           # Bash(git diff:*)/Bash(git log:*) are included because claude-code-action's
@@ -256,20 +262,25 @@ jobs:
           # context -- without them every review run reliably hits permission denials
           # on its very first context-gathering step. Bash(git status:*) is named in
           # that same prompt, and Bash(git show:*)/Bash(git grep:*) read file contents
-          # at a commit and search the checkout. All five git commands are read-only;
-          # `gh api` stays out because it can also write. The "Log denied tool calls"
-          # step below lists anything still denied.
+          # at a commit and search the checkout; those five are read-only.
+          # Bash(git fetch:*) lets a review refresh origin/main before diffing, which
+          # every review tried in the first logged runs (16 of 27 denials); it
+          # downloads from origin and updates local refs but cannot push. `gh api`
+          # stays out because it can also write. The "Log denied tool calls" step
+          # below lists anything still denied.
           claude_args: |
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(git grep:*),Read,Grep,Glob"
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(git grep:*),Bash(git fetch:*),Read,Grep,Glob"
             --max-turns ${{ env.REVIEW_MAX_TURNS }}
 
       - name: Log denied tool calls
         # The action logs only how many tool calls were denied. List them, grouped
-        # by tool (and for Bash, the command's first two words), then each call's
-        # input cut to 150 characters, so --allowedTools above can be tuned from
-        # real runs. The input can include a command or file path from the review,
-        # visible to anyone who can read this repo's Actions logs. Runs even when
-        # the review failed, and never fails the job.
+        # by tool (and for Bash, the command's first two words, plus a third for gh
+        # when it is a subcommand, so `gh pr diff` and `gh pr view` stay apart but
+        # every `gh api <path>` counts as `gh api`), then each call's input cut to
+        # 150 characters, so --allowedTools above can be tuned from real runs. The
+        # input can include a command or file path from the review, visible to
+        # anyone who can read this repo's Actions logs. Runs even when the review
+        # failed, and never fails the job.
         if: ${{ always() && steps.review.outputs.execution_file != '' }}
         env:
           EXECUTION_FILE: ${{ steps.review.outputs.execution_file }}
@@ -278,7 +289,8 @@ jobs:
             # "label" is a reserved word in jq, hence denial_label.
             def denial_label:
               if .tool_name == "Bash"
-              then "Bash(\((.tool_input.command // "") | split(" ") | map(select(length > 0)) | .[0:2] | join(" ")))"
+              then ((.tool_input.command // "") | split(" ") | map(select(length > 0))) as $words
+                | "Bash(\($words | if .[0] == "gh" and ((.[2] // "") | test("^[a-z][a-z-]*$")) then .[0:3] else .[0:2] end | join(" ")))"
               else .tool_name
               end;
             ([.[] | select(.type == "result")] | last | .permission_denials // []) as $denials
