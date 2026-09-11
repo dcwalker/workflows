@@ -275,8 +275,9 @@ jobs:
       - name: Log denied tool calls
         # The action logs only how many tool calls were denied. List them, grouped
         # by tool (and for Bash, the command's first two words, plus a third for gh
-        # when it is a subcommand, so `gh pr diff` and `gh pr view` stay apart but
-        # every `gh api <path>` counts as `gh api`), then each call's input cut to
+        # when it is a subcommand, never after `gh api`, so `gh pr diff` and
+        # `gh pr view` stay apart but every `gh api <path>` counts as `gh api`, even
+        # a single-word path such as `user` or `graphql`), then each call's input cut to
         # 150 characters, so --allowedTools above can be tuned from real runs. The
         # input can include a command or file path from the review, visible to
         # anyone who can read this repo's Actions logs. Runs even when the review
@@ -290,7 +291,7 @@ jobs:
             def denial_label:
               if .tool_name == "Bash"
               then ((.tool_input.command // "") | split(" ") | map(select(length > 0))) as $words
-                | "Bash(\($words | if .[0] == "gh" and ((.[2] // "") | test("^[a-z][a-z-]*$")) then .[0:3] else .[0:2] end | join(" ")))"
+                | "Bash(\($words | if .[0] == "gh" and .[1] != "api" and ((.[2] // "") | test("^[a-z][a-z-]*$")) then .[0:3] else .[0:2] end | join(" ")))"
               else .tool_name
               end;
             ([.[] | select(.type == "result")] | last | .permission_denials // []) as $denials
