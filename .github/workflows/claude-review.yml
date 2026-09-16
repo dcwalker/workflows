@@ -19,6 +19,19 @@ name: Claude PR Review (reusable)
 #   - Pushes (synchronize) do NOT re-run the review; the sticky "code-reviewed"
 #     and risk-level labels from the latest review keep deciding the gate.
 #
+# Re-running via GitHub's own "Re-run failed jobs" (rather than a fresh
+# "/re-review" comment) does NOT invoke Claude again: `github.run_attempt` (the
+# same run, a later attempt) skips checkout, fetching the review rubric, and
+# the review action itself, and goes straight to re-checking whatever
+# claude[bot] comment the first attempt already posted, then re-applying the
+# label and gate status from it. This is for when that first attempt's own
+# review completed and posted a real summary but a later step misparsed or
+# misreported it (a bug in this workflow, not in the review) — re-running
+# fixes the parsing without spending a new review. If the first attempt never
+# posted a summary at all (the review itself failed or was cut off), a re-run
+# finds nothing and fails the same way; comment "/re-review" for an actual
+# fresh review instead.
+#
 # Merge gating (configured in each caller repo's branch protection):
 #   - Required status check: `review / gate`
 #   - Require conversation resolution before merging
@@ -149,9 +162,15 @@ jobs:
         id: ctx
         # Both event shapes funnel through one set of outputs: the PR number, the
         # PR head SHA (needed for the commit status), whether this run came from a
-        # /re-review comment, and when this run attempt started (by GitHub's clock,
-        # the same clock that stamps comments) so the summary check below only
-        # counts comments posted during this run.
+        # /re-review comment, and when this run *first* started (by GitHub's
+        # clock, the same clock that stamps comments) so the summary check below
+        # only counts comments posted during this run.
+        #
+        # Always attempt 1's start, not the current attempt's: a "Re-run failed
+        # jobs" retry (github.run_attempt > 1, handled below) skips straight to
+        # that summary check to re-evaluate the comment the first attempt already
+        # posted, so the window has to reach back to when the run began, not
+        # reset at the retry.
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -159,7 +178,6 @@ jobs:
           PR_FROM_PR: ${{ github.event.pull_request.number }}
           PR_FROM_ISSUE: ${{ github.event.issue.number }}
           RUN_ID: ${{ github.run_id }}
-          RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           if [ "$EVENT" = "issue_comment" ]; then
             pr="$PR_FROM_ISSUE"; is_comment=true
@@ -167,9 +185,9 @@ jobs:
             pr="$PR_FROM_PR"; is_comment=false
           fi
           sha=$(gh pr view "$pr" -R "$REPO" --json headRefOid --jq .headRefOid)
-          started_at=$(gh api "repos/$REPO/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT" --jq .run_started_at)
+          started_at=$(gh api "repos/$REPO/actions/runs/$RUN_ID/attempts/1" --jq .run_started_at)
           if [ -z "$started_at" ]; then
-            echo "::error::Could not read the start time of run $RUN_ID attempt $RUN_ATTEMPT."
+            echo "::error::Could not read the start time of run $RUN_ID's first attempt."
             exit 1
           fi
           {
@@ -202,6 +220,10 @@ jobs:
           gh pr edit "$PR" -R "$REPO" --remove-label code-reviewed || true
 
       - name: Checkout the PR head
+        # Skipped on a "Re-run failed jobs" retry (attempt > 1): that path never
+        # invokes the review below, so it needs no checkout either — see the
+        # header comment and "Review the pull request"'s own condition.
+        if: github.run_attempt == '1'
         uses: actions/checkout@v4
         with:
           ref: ${{ steps.ctx.outputs.sha }}
@@ -213,6 +235,7 @@ jobs:
           fetch-depth: 0
 
       - name: Fetch review-code skill (single source of truth)
+        if: github.run_attempt == '1'
         env:
           GH_TOKEN: ${{ secrets.MARKETPLACE_READ_PAT }}
         run: |
@@ -223,6 +246,12 @@ jobs:
 
       - name: Review the pull request
         id: review
+        # Only the first attempt actually asks Claude to review; a "Re-run
+        # failed jobs" retry (attempt > 1) skips straight to "Verify the review
+        # posted its summary" below to re-check what this run's first attempt
+        # already posted, rather than spending a new review. See the header
+        # comment for when that is (and is not) useful.
+        if: github.run_attempt == '1'
         uses: anthropics/claude-code-action@v1
         env:
           # Run every subagent in the foreground. The action exits as soon as
@@ -318,18 +347,23 @@ jobs:
         if: success()
         # The action reports success whenever Claude ends its turn, including when
         # the turn ended before the review was posted. Require proof that the review
-        # finished: a claude[bot] comment created during this run whose last line
-        # containing a letter or digit is the `RISK-LEVEL: <BAND>` marker that
-        # review-code's SKILL.md puts at the end of its PR summary. Without one,
-        # fail the job so neither the risk-level nor the `code-reviewed` label is
-        # applied and the gate does not pass.
+        # finished: a claude[bot] comment created during this run with a
+        # `RISK-LEVEL: <BAND>` marker (case-insensitive) that review-code's
+        # SKILL.md puts at the end of its PR summary, among its last 5 lines.
+        # Without one, fail the job so neither the risk-level nor the
+        # `code-reviewed` label is applied and the gate does not pass.
         #
-        # Lines with no letter or digit are skipped rather than counted as the
-        # end: claude-code-action can append a decoration line after the summary
-        # (a lone " ·" ended the summary of dcwalker/DailyRoundup#638's re-review,
-        # run 34765313778, and hid its RISK-LEVEL: LOW). A trailing line with
-        # words in it still counts, so a comment that only mentions a marker
-        # earlier in its text is not mistaken for a finished summary.
+        # Scanning the last 5 lines rather than requiring the marker to be the
+        # literal last line tolerates whatever claude-code-action appends after
+        # the summary — a bare " ·" hid dcwalker/DailyRoundup#638's re-review
+        # RISK-LEVEL: LOW in run 34765313778, and a fuller " · [Branch](<url>)"
+        # link hid dcwalker/DailyRoundup#675's re-review RISK-LEVEL: LOW three
+        # times in a row (runs 35140670150, 35148269460, and 35148531636); an
+        # earlier fix matched the first shape specifically and the second one
+        # slipped past it. A small fixed window, rather than searching the whole
+        # comment, still keeps a mid-summary mention of the marker (e.g. this
+        # step's own description, if ever quoted) from being mistaken for the
+        # real one, as long as it is not itself within 5 lines of the end.
         #
         # The marker is a plain visible line, not an HTML comment: claude-code-action's
         # comment-posting tool strips HTML comments before storing the comment, so an
@@ -348,9 +382,11 @@ jobs:
           BAND=$(gh api --paginate "repos/$REPO/issues/$PR/comments?since=$START&per_page=100" --jq '
             .[]
             | select(.user.login == "claude[bot]" and .created_at >= $ENV.START)
-            | (.body | gsub("\r"; "") | split("\n") | map(select(test("[A-Za-z0-9]"))) | last // "") as $last
-            | select($last | test("^RISK-LEVEL: (NONE|LOW|MEDIUM|HIGH|CRITICAL)\\s*$"))
-            | "\(.updated_at) \($last | capture("^RISK-LEVEL: (?<band>[A-Z]+)").band)"
+            | (.body | gsub("\r"; "") | split("\n") | .[-5:]
+                | map(select(test("^\\s*RISK-LEVEL:\\s*(NONE|LOW|MEDIUM|HIGH|CRITICAL)\\s*$"; "i")))
+                | last // "") as $last
+            | select($last != "")
+            | "\(.updated_at) \($last | capture("RISK-LEVEL:\\s*(?<band>[A-Za-z]+)"; "i").band)"
           ' | sort | tail -1 | cut -d' ' -f2 | tr '[:upper:]' '[:lower:]')
 
           if [ -z "$BAND" ]; then
