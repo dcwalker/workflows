@@ -318,26 +318,23 @@ jobs:
         if: success()
         # The action reports success whenever Claude ends its turn, including when
         # the turn ended before the review was posted. Require proof that the review
-        # finished: a claude[bot] comment created during this run whose last
-        # non-decoration line is the `RISK-LEVEL: <BAND>` marker that review-code's
-        # SKILL.md puts at the end of its PR summary. Without one, fail the job so
-        # neither the risk-level nor the `code-reviewed` label is applied and the
-        # gate does not pass.
+        # finished: a claude[bot] comment created during this run with a
+        # `RISK-LEVEL: <BAND>` marker (case-insensitive) that review-code's
+        # SKILL.md puts at the end of its PR summary, among its last 5 lines.
+        # Without one, fail the job so neither the risk-level nor the
+        # `code-reviewed` label is applied and the gate does not pass.
         #
-        # Decoration lines are skipped rather than counted as the end:
-        # claude-code-action appends one after the summary, both a bare " ·" (a
-        # lone middle dot with nothing else, which hid dcwalker/DailyRoundup#638's
-        # re-review RISK-LEVEL: LOW in run 34765313778) and, on a /re-review run, a
-        # fuller " · [Branch](<url>)" link (which hid dcwalker/DailyRoundup#675's
-        # re-review RISK-LEVEL: LOW three times in a row, runs 35140670150,
-        # 35148269460, and 35148531636, because unlike the bare dot it has letters
-        # and digits in it and survived a filter that only excluded lines with
-        # neither). Both start with that middle dot (U+00B7) once leading
-        # whitespace is stripped, which no line of the review's own prose does, so
-        # a decoration line is identified by that leading marker now, not by
-        # whether the rest of the line happens to contain a letter or digit. A
-        # trailing prose line still counts, so a comment that only mentions a
-        # marker earlier in its text is not mistaken for a finished summary.
+        # Scanning the last 5 lines rather than requiring the marker to be the
+        # literal last line tolerates whatever claude-code-action appends after
+        # the summary — a bare " ·" hid dcwalker/DailyRoundup#638's re-review
+        # RISK-LEVEL: LOW in run 34765313778, and a fuller " · [Branch](<url>)"
+        # link hid dcwalker/DailyRoundup#675's re-review RISK-LEVEL: LOW three
+        # times in a row (runs 35140670150, 35148269460, and 35148531636); an
+        # earlier fix matched the first shape specifically and the second one
+        # slipped past it. A small fixed window, rather than searching the whole
+        # comment, still keeps a mid-summary mention of the marker (e.g. this
+        # step's own description, if ever quoted) from being mistaken for the
+        # real one, as long as it is not itself within 5 lines of the end.
         #
         # The marker is a plain visible line, not an HTML comment: claude-code-action's
         # comment-posting tool strips HTML comments before storing the comment, so an
@@ -356,9 +353,11 @@ jobs:
           BAND=$(gh api --paginate "repos/$REPO/issues/$PR/comments?since=$START&per_page=100" --jq '
             .[]
             | select(.user.login == "claude[bot]" and .created_at >= $ENV.START)
-            | (.body | gsub("\r"; "") | split("\n") | map(select(test("^\\s*·") | not)) | map(select(test("[A-Za-z0-9]"))) | last // "") as $last
-            | select($last | test("^RISK-LEVEL: (NONE|LOW|MEDIUM|HIGH|CRITICAL)\\s*$"))
-            | "\(.updated_at) \($last | capture("^RISK-LEVEL: (?<band>[A-Z]+)").band)"
+            | (.body | gsub("\r"; "") | split("\n") | .[-5:]
+                | map(select(test("^\\s*RISK-LEVEL:\\s*(NONE|LOW|MEDIUM|HIGH|CRITICAL)\\s*$"; "i")))
+                | last // "") as $last
+            | select($last != "")
+            | "\(.updated_at) \($last | capture("RISK-LEVEL:\\s*(?<band>[A-Za-z]+)"; "i").band)"
           ' | sort | tail -1 | cut -d' ' -f2 | tr '[:upper:]' '[:lower:]')
 
           if [ -z "$BAND" ]; then
