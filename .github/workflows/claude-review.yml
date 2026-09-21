@@ -494,11 +494,19 @@ jobs:
         # caller grants it, and the listing was refused on
         # dcwalker/DailyRoundup#638 (run 34767790939), leaving its stale gate
         # failure in place after a low-risk re-review.
+        #
+        # The head is read again here rather than reusing the SHA this review
+        # examined. A push made while the review runs moves the head, and it is
+        # the new head's gate that branch protection reads — the one that failed
+        # because it ran before this review applied its labels. Keyed to the
+        # reviewed SHA, this step looked at the commit that was already fine and
+        # left the new head red (dcwalker/DailyRoundup#736).
         if: ${{ success() && steps.block.outcome == 'success' && (steps.summary.outputs.band == 'none' || steps.summary.outputs.band == 'low') }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          SHA: ${{ steps.ctx.outputs.sha }}
+          PR: ${{ steps.ctx.outputs.pr }}
+          REVIEWED_SHA: ${{ steps.ctx.outputs.sha }}
           # The caller workflow's ref, e.g. owner/repo/.github/workflows/x.yml@refs/heads/main;
           # the github context of a called workflow is the caller's.
           WORKFLOW_REF: ${{ github.workflow_ref }}
@@ -507,6 +515,14 @@ jobs:
           # the `review / gate` check runs there.
           workflow_path=${WORKFLOW_REF#"$REPO/"}
           workflow_path=${workflow_path%%@*}
+
+          if ! SHA=$(gh pr view "$PR" -R "$REPO" --json headRefOid --jq .headRefOid); then
+            echo "::error::Could not read the head of PR $PR, so a stale failed review / gate job may still block the merge. Re-run that job from the Actions tab."
+            exit 1
+          fi
+          if [ "$SHA" != "$REVIEWED_SHA" ]; then
+            echo "The head moved to $SHA while this review ran on $REVIEWED_SHA; the gate on the new head is the one that blocks the merge."
+          fi
 
           # Each API call is checked on its own rather than piped into sort: a
           # refused request prints its error body to stdout, and through a pipe
@@ -554,7 +570,10 @@ jobs:
     #   1. the review completed: it ran successfully in this workflow, or ran in
     #      an earlier run (github-actions[bot] applied 'code-reviewed' at some
     #      point — judged by the label event history, so a transient /re-review
-    #      removal doesn't matter; a human-applied one is ignored), and
+    #      removal doesn't matter; a human-applied one is ignored). When no such
+    #      review has completed but one is running for this PR, the gate waits
+    #      for it rather than ruling on a PR whose review has not had its say,
+    #      and
     #   2. the latest review rated the PR no or low risk: the PR carries a
     #      "no risk" or "low risk" label whose most recent application was by
     #      github-actions[bot]. A human-applied risk label is ignored.
@@ -570,8 +589,62 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
           REVIEW_RESULT: ${{ needs.review.result }}
+          RUN_ID: ${{ github.run_id }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          # How long to wait for a review that is already running before
+          # deciding this PR has none.
+          REVIEW_WAIT_SECONDS: 900
         run: |
+          workflow_path=${WORKFLOW_REF#"$REPO/"}
+          workflow_path=${workflow_path%%@*}
+
+          # The `review / review` jobs that are queued or running for this PR in
+          # some other run of this workflow. A review this workflow skipped is
+          # `completed/skipped` and never matches, so two gate-only runs can
+          # never end up waiting on each other.
+          running_review_jobs() {
+            local run_ids rid
+            run_ids=$(gh api --paginate "repos/$REPO/actions/runs?branch=$HEAD_REF&per_page=100" \
+              --jq ".workflow_runs[]
+                    | select(.path == \"$workflow_path\")
+                    | select((.id | tostring) != \"$RUN_ID\")
+                    | select(.status != \"completed\")
+                    | .id") || return 1
+            for rid in $run_ids; do
+              gh api "repos/$REPO/actions/runs/$rid/jobs?filter=latest&per_page=100" \
+                --jq '.jobs[] | select(.name == "review / review" and .status != "completed") | .id' || return 1
+            done
+          }
+
+          # True once a review that was already running has finished, so its
+          # labels are worth re-reading; false if none was running, the wait ran
+          # out, or the listing was refused.
+          wait_for_running_review() {
+            local deadline jobs
+            jobs=$(running_review_jobs) || {
+              echo "::warning::Could not list this PR's workflow runs, so a review that is running now was not waited for."
+              return 1
+            }
+            [ -n "$jobs" ] || return 1
+            echo "A code review is already running for this PR; waiting up to ${REVIEW_WAIT_SECONDS}s for it to finish before deciding this PR has none."
+            deadline=$(( $(date +%s) + REVIEW_WAIT_SECONDS ))
+            while [ -n "$jobs" ]; do
+              if [ "$(date +%s)" -ge "$deadline" ]; then
+                echo "::warning::The code review that was running did not finish within ${REVIEW_WAIT_SECONDS}s."
+                return 1
+              fi
+              sleep 20
+              jobs=$(running_review_jobs) || return 1
+            done
+            # The labels are applied before the review job ends, but the events
+            # API is read-after-write on someone else's clock.
+            sleep 5
+            echo "The code review that was running has finished; re-reading its labels."
+            return 0
+          }
+
           author=$(gh pr view "$PR" -R "$REPO" --json author --jq '.author.login')
+          HEAD_REF=$(gh pr view "$PR" -R "$REPO" --json headRefName --jq '.headRefName')
           labels=$(gh pr view "$PR" -R "$REPO" --json labels --jq '.labels[].name')
           has() { printf '%s\n' "$labels" | grep -qx "$1"; }
 
@@ -604,6 +677,18 @@ jobs:
             # so checking current presence would make a concurrent push's gate fail
             # and stick. The bot-applied labeled event persists in history either way.
             bot_applied=$(jq '[.[] | select(.event=="labeled" and .label.name=="code-reviewed" and .actor.login=="github-actions[bot]")] | length' <<< "$events")
+
+            # A review may be running right now. The first review of a PR is
+            # triggered by open/ready, and a push landing while it runs gets a
+            # gate of its own that would otherwise rule "no review" minutes
+            # before that review applies its labels — a race, not a verdict
+            # (dcwalker/DailyRoundup#736). Waiting costs nothing when no review
+            # is running, which is the ordinary case.
+            if [ "${bot_applied:-0}" -eq 0 ] && wait_for_running_review; then
+              events=$(gh api --paginate "repos/$REPO/issues/$PR/events?per_page=100" | jq -s 'add // []')
+              bot_applied=$(jq '[.[] | select(.event=="labeled" and .label.name=="code-reviewed" and .actor.login=="github-actions[bot]")] | length' <<< "$events")
+            fi
+
             if [ "${bot_applied:-0}" -eq 0 ]; then
               if has code-reviewed; then
                 echo "::warning::'code-reviewed' is present but was never applied by github-actions[bot]; ignoring it. Only the automated review may grant this label."
