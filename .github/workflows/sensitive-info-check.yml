@@ -72,8 +72,14 @@ on:
       SENSITIVE_DENYLIST:
         required: true
       GH_TOKEN:
-        description: 'github.token from the caller — used to create issues in the calling repo'
-        required: true
+        description: >-
+          Optional. Token for opening issues in the calling repo. When empty,
+          the issue step uses this workflow's own github.token, which already
+          belongs to the calling repo and carries the issues: write permission
+          the job requests. Callers that pass github.token here send an
+          empty value, because that expression is evaluated for the calling
+          job before any token has been issued.
+        required: false
 
 jobs:
   sensitive-info:
@@ -420,7 +426,11 @@ jobs:
       - name: Open issue on detection (detective modes only)
         if: failure() && inputs.event_name != 'pull_request' && inputs.actor != 'dependabot[bot]'
         env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          # secrets.GH_TOKEN arrives empty from every caller that passes
+          # github.token, so fall back to this job's own token. Without
+          # the fallback, gh exited 4 (not authenticated) and no issue was ever
+          # opened, leaving scheduled audits failing with nothing to notice.
+          GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
           GH_REPO: ${{ inputs.repository }}
           SCAN_MODE: ${{ inputs.event_name == 'push' && 'push' || 'audit' }}
           RUN_URL: ${{ inputs.run_url }}
@@ -428,6 +438,10 @@ jobs:
           ASSIGNEE: ${{ inputs.assignee }}
           FINDINGS_OUT: ${{ github.workspace }}/sensitive-info-findings.txt
         run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::No token available to open an issue in ${GH_REPO}. The scan failure above still stands; check that the job has issues: write."
+            exit 1
+          fi
           body_file="$(mktemp)"
           {
             echo "A sensitive-information scan failed on \`${REF_NAME}\` in **${SCAN_MODE}** mode."
