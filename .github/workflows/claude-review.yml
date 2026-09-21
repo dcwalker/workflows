@@ -602,9 +602,16 @@ jobs:
           # some other run of this workflow. A review this workflow skipped is
           # `completed/skipped` and never matches, so two gate-only runs can
           # never end up waiting on each other.
+          #
+          # The branch goes as a query field rather than spliced into the URL: a
+          # branch name may hold `&` or `+`, which would split the query or read
+          # as a space, and the listing would find no runs at all. `--method
+          # GET` because `gh api` sends fields as a POST body otherwise, and a
+          # POST to this endpoint is a 404.
           running_review_jobs() {
-            local run_ids rid
-            run_ids=$(gh api --paginate "repos/$REPO/actions/runs?branch=$HEAD_REF&per_page=100" \
+            local head_ref=$1 run_ids rid
+            run_ids=$(gh api --paginate --method GET "repos/$REPO/actions/runs" \
+              -f branch="$head_ref" -f per_page=100 \
               --jq ".workflow_runs[]
                     | select(.path == \"$workflow_path\")
                     | select((.id | tostring) != \"$RUN_ID\")
@@ -620,8 +627,14 @@ jobs:
           # labels are worth re-reading; false if none was running, the wait ran
           # out, or the listing was refused.
           wait_for_running_review() {
-            local deadline jobs
-            jobs=$(running_review_jobs) || {
+            local head_ref deadline jobs
+            # Read here rather than up front: only a PR with no completed review
+            # gets this far, so most gate runs never need it.
+            head_ref=$(gh pr view "$PR" -R "$REPO" --json headRefName --jq '.headRefName') || {
+              echo "::warning::Could not read this PR's branch, so a review that is running now was not waited for."
+              return 1
+            }
+            jobs=$(running_review_jobs "$head_ref") || {
               echo "::warning::Could not list this PR's workflow runs, so a review that is running now was not waited for."
               return 1
             }
@@ -634,7 +647,7 @@ jobs:
                 return 1
               fi
               sleep 20
-              jobs=$(running_review_jobs) || return 1
+              jobs=$(running_review_jobs "$head_ref") || return 1
             done
             # The labels are applied before the review job ends, but the events
             # API is read-after-write on someone else's clock.
@@ -644,7 +657,6 @@ jobs:
           }
 
           author=$(gh pr view "$PR" -R "$REPO" --json author --jq '.author.login')
-          HEAD_REF=$(gh pr view "$PR" -R "$REPO" --json headRefName --jq '.headRefName')
           labels=$(gh pr view "$PR" -R "$REPO" --json labels --jq '.labels[].name')
           has() { printf '%s\n' "$labels" | grep -qx "$1"; }
 
