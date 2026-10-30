@@ -49,7 +49,10 @@ name: Claude PR Review (reusable)
 # therefore keeps merging blocked. A passing re-review also re-runs the PR head's
 # most recent `review / gate` check run if it failed (for example, on a push made
 # while the PR was rated high risk): GitHub counts that check run, and the commit
-# status alone would not clear it.
+# status alone would not clear it. The reverse holds too: a re-review's failing
+# commit status still blocks after a later `gate` check run passes (say, once the
+# PR gets the "skip-code-review" label), so a passing `gate` sets that commit
+# status to success when it finds one in any other state.
 #
 # Caller example (in another repo owned by dcwalker):
 #   on:
@@ -589,6 +592,7 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
           REVIEW_RESULT: ${{ needs.review.result }}
+          SHA: ${{ github.event.pull_request.head.sha }}
           RUN_ID: ${{ github.run_id }}
           WORKFLOW_REF: ${{ github.workflow_ref }}
           # How long to wait for a review that is already running before
@@ -656,17 +660,40 @@ jobs:
             return 0
           }
 
+          # GitHub counts both this check run and any `review / gate` commit
+          # status a /re-review posted on the head, so a failing or pending one
+          # from an earlier re-review would still block after this passes. Set
+          # it to match. A head no re-review touched has none, and gets none.
+          pass() {
+            local latest
+            echo "PASS: $1"
+            if ! latest=$(gh api "repos/$REPO/commits/$SHA/statuses?per_page=100" \
+                --jq '[.[] | select(.context == "review / gate")][0].state // empty'); then
+              echo "::warning::Could not read the review / gate commit status on $SHA, so one an earlier /re-review left may still block the merge."
+              exit 0
+            fi
+            if [ -n "$latest" ] && [ "$latest" != "success" ]; then
+              if gh api -X POST "repos/$REPO/statuses/$SHA" \
+                  -f state=success \
+                  -f context='review / gate' \
+                  -f description="${1:0:140}" > /dev/null; then
+                echo "Set the review / gate commit status an earlier /re-review left ($latest) to success."
+              else
+                echo "::warning::Could not update the $latest review / gate commit status on $SHA, so it still blocks the merge. Grant 'statuses: write' in the caller workflow."
+              fi
+            fi
+            exit 0
+          }
+
           author=$(gh pr view "$PR" -R "$REPO" --json author --jq '.author.login')
           labels=$(gh pr view "$PR" -R "$REPO" --json labels --jq '.labels[].name')
           has() { printf '%s\n' "$labels" | grep -qx "$1"; }
 
           if [ "$author" = "dependabot[bot]" ] || [ "$author" = "app/dependabot" ]; then
-            echo "PASS: Dependabot PR — Claude review is intentionally skipped for it."
-            exit 0
+            pass "Dependabot PR — Claude review is intentionally skipped for it."
           fi
           if has skip-code-review; then
-            echo "PASS: 'skip-code-review' label present — review intentionally skipped."
-            exit 0
+            pass "'skip-code-review' label present — review intentionally skipped."
           fi
 
           # One fetch of the label event history serves both checks below. Pages
@@ -725,8 +752,7 @@ jobs:
 
           case "$risk_label" in
             "no risk"|"low risk")
-              echo "PASS: the latest review rated this PR '$risk_label'."
-              exit 0
+              pass "the latest review rated this PR '$risk_label'."
               ;;
             "")
               echo "::error::No risk-level label from the automated review is on this PR, so its risk is unknown. Comment '/re-review' to run a review that sets one."
