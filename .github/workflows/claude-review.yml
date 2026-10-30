@@ -11,9 +11,11 @@ name: Claude PR Review (reusable)
 #
 # Triggers:
 #   - pull_request opened/ready_for_review/reopened (non-draft): automatic review.
-#   - issue_comment containing "/re-review" on a PR, from a repo
+#   - issue_comment containing "/re-review" on a non-draft PR, from a repo
 #     owner/member/collaborator: an on-demand fresh review with the native
 #     progress UI that also blocks merging until it finishes (see "Merge gating").
+#   - Never for draft PRs, whether opened as a draft or commented "/re-review"
+#     on: mark the PR ready for review to start the review.
 #   - Never for dependabot PRs (they cannot read the secrets below) or for PRs
 #     carrying the "skip-code-review" label.
 #   - Pushes (synchronize) do NOT re-run the review; the sticky "code-reviewed"
@@ -106,8 +108,10 @@ jobs:
     # Centralized run conditions for every caller. Run the Claude review only
     # when it is worth spending resources:
     #   - a non-draft PR is opened, marked ready, or reopened, OR
-    #   - a repo owner/member/collaborator comments "/re-review" on a PR.
+    #   - a repo owner/member/collaborator comments "/re-review" on a non-draft PR.
     # Never run when:
+    #   - the PR is a draft: marking it ready for review starts the review, and
+    #     the gate's error says so,
     #   - the PR is from dependabot: it uses the Dependabot secret source and
     #     cannot read the secrets below, so a review would only ever fail, or
     #   - the `skip-code-review` label opts the PR out.
@@ -127,6 +131,7 @@ jobs:
         || (
           github.event_name == 'issue_comment'
           && github.event.issue.pull_request != null
+          && github.event.issue.draft != true
           && contains(github.event.comment.body, '/re-review')
           && github.event.comment.user.type != 'Bot'
           && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
@@ -689,6 +694,16 @@ jobs:
           labels=$(gh pr view "$PR" -R "$REPO" --json labels --jq '.labels[].name')
           has() { printf '%s\n' "$labels" | grep -qx "$1"; }
 
+          # Neither the automatic review nor "/re-review" runs on a draft, so
+          # the errors below tell a draft's author to mark it ready instead of
+          # suggesting a "/re-review" that would do nothing.
+          is_draft=$(gh pr view "$PR" -R "$REPO" --json isDraft --jq '.isDraft')
+          if [ "$is_draft" = "true" ]; then
+            review_hint="This PR is a draft, and drafts are never reviewed: '/re-review' does nothing on a draft. Mark the PR ready for review to start the review"
+          else
+            review_hint="Comment '/re-review' to run a review"
+          fi
+
           if [ "$author" = "dependabot[bot]" ] || [ "$author" = "app/dependabot" ]; then
             pass "Dependabot PR — Claude review is intentionally skipped for it."
           fi
@@ -732,7 +747,11 @@ jobs:
               if has code-reviewed; then
                 echo "::warning::'code-reviewed' is present but was never applied by github-actions[bot]; ignoring it. Only the automated review may grant this label."
               fi
-              echo "::error::Code review has not completed for this PR. It runs automatically on open/ready; comment '/re-review' to run it now, or apply 'skip-code-review' to bypass."
+              if [ "$is_draft" = "true" ]; then
+                echo "::error::Code review has not run for this PR. $review_hint, or apply 'skip-code-review' to bypass."
+              else
+                echo "::error::Code review has not completed for this PR. It runs automatically when a non-draft PR is opened, reopened, or marked ready for review. $review_hint now, or apply 'skip-code-review' to bypass."
+              fi
               exit 1
             fi
             echo "'code-reviewed' was applied by github-actions[bot]; review completed in an earlier run."
@@ -755,11 +774,11 @@ jobs:
               pass "the latest review rated this PR '$risk_label'."
               ;;
             "")
-              echo "::error::No risk-level label from the automated review is on this PR, so its risk is unknown. Comment '/re-review' to run a review that sets one."
+              echo "::error::No risk-level label from the automated review is on this PR, so its risk is unknown. $review_hint that sets one."
               exit 1
               ;;
             *)
-              echo "::error::The latest review rated this PR '$risk_label'. Only 'no risk' and 'low risk' PRs pass. Address the review findings, then comment '/re-review'."
+              echo "::error::The latest review rated this PR '$risk_label'. Only 'no risk' and 'low risk' PRs pass. Address the review findings. $review_hint."
               exit 1
               ;;
           esac
